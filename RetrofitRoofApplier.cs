@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using Autodesk.Revit.DB;
 using Autodesk.Revit.UI;
@@ -17,7 +18,7 @@ namespace RevitLOD3Exporter
         private const string PARAM_EA_PV_SYSTEM_TYPE = "ea_roof_pv_system_type";           // attached|mounted|bipv (text)
         private const string PARAM_EA_STRUCT_FLAG = "ea_roof_structural_capacity_flag";    // bool/int
         private const string PARAM_EA_PV_PANEL_COUNT = "ea_pv_panel_count";                // int
-        private const string PARAM_EA_PV_ADDED_AREA_M2 = "ea_pv_added_area_m2";            // area
+        private const string PARAM_EA_PV_ADDED_AREA_M2 = "ea_pv_added_area_m2";            // area (m2 in your logic)
         private const string PARAM_EA_PV_LAYOUT_STATUS = "ea_pv_layout_status";            // text
 
         private const string PARAM_WE_ROOF_RAIN_STRATEGY = "we_roof_rainwater_strategy";   // none|basic|enhanced
@@ -28,17 +29,26 @@ namespace RevitLOD3Exporter
         // =========================
         // Performance
         // =========================
-        private const int BATCH_SIZE = 30; // reduce lag; 20-50 reasonable
+        private const int BATCH_SIZE = 30;
+
+        // =========================
+        // Base choice default
+        // =========================
+        // ✅ You said you previously "统一写给所有屋顶" and want strategy-driven.
+        // If ss_roof_heat_strategy is NONE/empty:
+        // - set to true => default to ROOF_RETROFIT_L1
+        // - set to false => default to ROOF_EXISTING
+        private const bool DEFAULT_TO_RETROFIT_L1_WHEN_NO_HEAT_STRATEGY = true;
 
         public static void Apply(Document doc)
         {
             if (doc == null) throw new ArgumentNullException(nameof(doc));
 
-            // 1) Index all RoofTypes by Name (case-insensitive)
-            var roofTypes = new FilteredElementCollector(doc)
+            // 1) Index RoofTypes by normalized name (robust)
+            var roofTypesByKey = new FilteredElementCollector(doc)
                 .OfClass(typeof(RoofType))
                 .Cast<RoofType>()
-                .GroupBy(rt => rt.Name, StringComparer.OrdinalIgnoreCase)
+                .GroupBy(rt => NormalizeKey(rt.Name), StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
 
             // 2) Collect all roof instances
@@ -60,12 +70,17 @@ namespace RevitLOD3Exporter
             int planned = 0;
             int changed = 0;
 
+            // diagnostics
+            int pvWantedCount = 0;
+            int pvAppliedCount = 0;
+            int pvBlockedByStructFlag = 0;
+
             var samples = new List<string>();
 
-            // 3) Build mapping: building_id -> names of RoofTypes in Revit
+            // 3) Mapping: building_id -> names of RoofTypes in Revit
             var map = BuildRoofTypeMapping();
 
-            // 4) Build plan outside of transaction (fast)
+            // 4) Build plan outside transaction
             var plan = new List<RooftopChange>();
 
             foreach (var e in roofs)
@@ -73,7 +88,7 @@ namespace RevitLOD3Exporter
                 Element roof = e;
                 if (roof == null) continue;
 
-                string buildingId = GetStringParam(roof, PARAM_BUILDING_ID);
+                string buildingId = GetParamAsText(roof, PARAM_BUILDING_ID);
                 if (string.IsNullOrWhiteSpace(buildingId))
                 {
                     skippedNoBuildingId++;
@@ -88,11 +103,14 @@ namespace RevitLOD3Exporter
                     continue;
                 }
 
-                // Determine target roof type name based on rules:
-                // (1) base retrofit level / heat strategy -> EXISTING / RETROFIT_L1 / GREEN_L2 / COOL_L3
-                // (2) PV overlay: if pv_strategy != none AND structural_flag true -> ROOF_PV
-                string targetTypeName = DecideTargetRoofTypeName(roof, names);
+                // Decide target roof type name based on instance strategy params
+                var decision = DecideTargetRoofTypeName(doc, roof, names);
 
+                if (decision.WantPv) pvWantedCount++;
+                if (decision.PvBlockedByStructFlag) pvBlockedByStructFlag++;
+                if (decision.TargetIsPv) pvAppliedCount++;
+
+                string targetTypeName = decision.TargetTypeName;
                 if (string.IsNullOrWhiteSpace(targetTypeName))
                 {
                     skippedNoTarget++;
@@ -100,14 +118,14 @@ namespace RevitLOD3Exporter
                     continue;
                 }
 
-                if (!roofTypes.TryGetValue(targetTypeName, out RoofType targetType))
+                string targetKey = NormalizeKey(targetTypeName);
+                if (!roofTypesByKey.TryGetValue(targetKey, out RoofType targetType))
                 {
                     skippedTargetMissing++;
                     if (samples.Count < 6) samples.Add($"Roof {roof.Id}: target type '{targetTypeName}' NOT found");
                     continue;
                 }
 
-                // Some roofs may be special types; ChangeTypeId generally works for Roofs, but we guard anyway.
                 if (roof.GetTypeId() == ElementId.InvalidElementId)
                 {
                     skippedNotChangeable++;
@@ -121,7 +139,6 @@ namespace RevitLOD3Exporter
                     continue;
                 }
 
-                // Snapshot to keep position stable
                 var snap = CaptureRoofSnapshot(roof);
 
                 plan.Add(new RooftopChange
@@ -136,13 +153,13 @@ namespace RevitLOD3Exporter
                 planned++;
             }
 
-            // 5) Apply changes in batches (less lag)
+            // 5) Apply in batches
             int idx = 0;
             while (idx < plan.Count)
             {
                 int take = Math.Min(BATCH_SIZE, plan.Count - idx);
 
-                using (Transaction tx = new Transaction(doc, "EA Retrofit - Roofs"))
+                using (Transaction tx = new Transaction(doc, "EA Retrofit - Roofs (by strategies)"))
                 {
                     tx.Start();
 
@@ -155,8 +172,6 @@ namespace RevitLOD3Exporter
                         try
                         {
                             roof.ChangeTypeId(item.TargetTypeId);
-
-                            // Restore critical instance placement params (offset + room bounding)
                             RestoreRoofSnapshot(roof, item.Snapshot);
 
                             changed++;
@@ -179,9 +194,12 @@ namespace RevitLOD3Exporter
 
             string report =
                 $"Total roofs: {total}\n" +
-                $"Planned changes: {planned}\n" +
+                $"Planned: {planned}\n" +
                 $"Changed: {changed}\n" +
-                $"Already target: {alreadyTarget}\n\n" +
+                $"Already target: {alreadyTarget}\n" +
+                $"PV wanted: {pvWantedCount}\n" +
+                $"PV applied (roof type switched to PV): {pvAppliedCount}\n" +
+                $"PV blocked by structural flag: {pvBlockedByStructFlag}\n" +
                 $"Skipped (no building_id): {skippedNoBuildingId}\n" +
                 $"Skipped (building_id not mapped): {skippedBuildingNotMapped}\n" +
                 $"Skipped (no target decided): {skippedNoTarget}\n" +
@@ -193,37 +211,74 @@ namespace RevitLOD3Exporter
         }
 
         // =====================================================
-        // Decision rules
+        // Decision rules (instance-first; robust param reading)
         // =====================================================
-        private static string DecideTargetRoofTypeName(Element roof, RoofTypeNames names)
+
+        private struct RoofDecision
         {
-            // ---- Base choice: by SS roof heat strategy + (optional) retrofit level
-            // Your current roof family set:
-            // ROOF_EXISTING, ROOF_RETROFIT_L1, ROOF_GREEN_L2, ROOF_COOL_L3, ROOF_PV
+            public string TargetTypeName;
+            public bool WantPv;
+            public bool TargetIsPv;
+            public bool PvBlockedByStructFlag;
+        }
 
-            string heat = NormalizeHeat(GetStringParam(roof, PARAM_SS_ROOF_HEAT)); // GREEN / COOL / NONE
+        private static RoofDecision DecideTargetRoofTypeName(Document doc, Element roof, RoofTypeNames names)
+        {
+            // ---- Base choice by SS heat strategy
+            string heatRaw = GetParamAsText(roof, PARAM_SS_ROOF_HEAT);
+            string heat = NormalizeHeat(heatRaw); // GREEN / COOL / NONE
 
-            // If you want to use retrofit L1 as default when no SS strategy is set,
-            // change base = names.ROOF_RETROFIT_L1 instead.
             string baseType =
                 heat == "GREEN" ? names.ROOF_GREEN_L2 :
                 heat == "COOL" ? names.ROOF_COOL_L3 :
-                names.ROOF_EXISTING;
+                (DEFAULT_TO_RETROFIT_L1_WHEN_NO_HEAT_STRATEGY ? names.ROOF_RETROFIT_L1 : names.ROOF_EXISTING);
 
-            // ---- PV overlay: ONLY switch to ROOF_PV if want PV AND structural flag is true
-            string pvStrategy = NormalizePvStrategy(GetStringParam(roof, PARAM_EA_PV_STRATEGY)); // NONE / PV
+            // ---- PV overlay (only if want PV AND structural flag true)
+            string pvRaw = GetParamAsText(roof, PARAM_EA_PV_STRATEGY);
+            string pvStrategy = NormalizePvStrategy(pvRaw); // NONE / PV
+
             bool structOk = GetBoolLike(roof, PARAM_EA_STRUCT_FLAG);
 
-            // Extra guard: if pv numbers are 0 and strategy empty, treat as NONE
+            // panelCount often stored as int (or string)
             int panelCount = GetIntLike(roof, PARAM_EA_PV_PANEL_COUNT);
-            double pvAreaM2 = GetDoubleLike(roof, PARAM_EA_PV_ADDED_AREA_M2);
 
-            bool wantPv = (pvStrategy == "PV") || panelCount > 0 || pvAreaM2 > 0.0001;
+            // pv added area stored as Area (internal units ft^2). We convert to m^2 if it's a Double area.
+            double pvAreaM2 = GetAreaM2Like(doc, roof, PARAM_EA_PV_ADDED_AREA_M2);
 
+            bool wantPv = (pvStrategy == "PV") || panelCount > 0 || pvAreaM2 > 1e-6;
+
+            // If want PV but struct flag false => keep base
+            if (wantPv && !structOk)
+            {
+                return new RoofDecision
+                {
+                    TargetTypeName = baseType,
+                    WantPv = true,
+                    TargetIsPv = false,
+                    PvBlockedByStructFlag = true
+                };
+            }
+
+            // If want PV and struct ok => PV type
             if (wantPv && structOk && !string.IsNullOrWhiteSpace(names.ROOF_PV))
-                return names.ROOF_PV;
+            {
+                return new RoofDecision
+                {
+                    TargetTypeName = names.ROOF_PV,
+                    WantPv = true,
+                    TargetIsPv = true,
+                    PvBlockedByStructFlag = false
+                };
+            }
 
-            return baseType;
+            // default base
+            return new RoofDecision
+            {
+                TargetTypeName = baseType,
+                WantPv = wantPv,
+                TargetIsPv = false,
+                PvBlockedByStructFlag = false
+            };
         }
 
         private static string NormalizeHeat(string raw)
@@ -232,7 +287,9 @@ namespace RevitLOD3Exporter
             raw = raw.Trim().ToLowerInvariant();
 
             if (raw.Contains("green")) return "GREEN"; // green_roof
-            if (raw.Contains("cool")) return "COOL";  // cool_roof
+            if (raw.Contains("cool")) return "COOL";   // cool_roof
+            if (raw == "none" || raw == "0" || raw == "false" || raw == "no") return "NONE";
+
             return "NONE";
         }
 
@@ -241,7 +298,7 @@ namespace RevitLOD3Exporter
             if (string.IsNullOrWhiteSpace(raw)) return "NONE";
             raw = raw.Trim().ToLowerInvariant();
 
-            if (raw == "none" || raw == "0") return "NONE";
+            if (raw == "none" || raw == "0" || raw == "false" || raw == "no") return "NONE";
             // limited / full / pv_ready etc.
             return "PV";
         }
@@ -249,6 +306,7 @@ namespace RevitLOD3Exporter
         // =====================================================
         // Mapping: fill with YOUR Revit RoofType names
         // =====================================================
+
         private class RoofTypeNames
         {
             public string ROOF_EXISTING;
@@ -279,7 +337,7 @@ namespace RevitLOD3Exporter
                     "building_0002",
                     new RoofTypeNames
                     {
-                        ROOF_EXISTING    = "KLH 200",
+                        ROOF_EXISTING    = "WD 200",
                         ROOF_RETROFIT_L1 = "KLH 200 Insulated",
                         ROOF_GREEN_L2    = "KLH 200 Green",
                         ROOF_COOL_L3     = "KLH 200 Cool",
@@ -292,6 +350,7 @@ namespace RevitLOD3Exporter
         // =====================================================
         // Snapshot: keep position stable (Offset + Room Bounding)
         // =====================================================
+
         private class RoofSnapshot
         {
             public ElementId LevelId = ElementId.InvalidElementId; // for checking only
@@ -312,7 +371,6 @@ namespace RevitLOD3Exporter
         {
             var s = new RoofSnapshot();
 
-            // Level (check only)
             try
             {
                 var pLvl = roof.get_Parameter(BuiltInParameter.LEVEL_PARAM);
@@ -321,8 +379,6 @@ namespace RevitLOD3Exporter
             }
             catch { }
 
-            // Offset (Roof level offset)
-            // Note: for roofs this is commonly ROOF_LEVEL_OFFSET_PARAM
             try
             {
                 var pOff = roof.get_Parameter(BuiltInParameter.ROOF_LEVEL_OFFSET_PARAM);
@@ -331,7 +387,6 @@ namespace RevitLOD3Exporter
             }
             catch { }
 
-            // Room Bounding - cross-language by parameter name
             try
             {
                 var pRb =
@@ -349,7 +404,6 @@ namespace RevitLOD3Exporter
         {
             if (roof == null || s == null) return;
 
-            // Offset restore
             try
             {
                 if (s.OffsetInternal.HasValue)
@@ -361,7 +415,6 @@ namespace RevitLOD3Exporter
             }
             catch { }
 
-            // Room Bounding restore by name
             try
             {
                 if (s.RoomBoundingInt.HasValue)
@@ -377,30 +430,39 @@ namespace RevitLOD3Exporter
         }
 
         // =====================================================
-        // Helpers
+        // Robust param reading helpers (StorageType-safe)
         // =====================================================
-        private static string SanitizeId(string s)
-        {
-            s = (s ?? "").Trim();
-            s = s.Trim('\'').Trim('"');
-            return s;
-        }
 
-        private static string GetStringParam(Element e, string name)
+        private static string GetParamAsText(Element e, string paramName)
         {
             try
             {
-                var p = e.LookupParameter(name);
-                return p != null ? p.AsString() : null;
+                var p = e?.LookupParameter(paramName);
+                if (p == null) return "";
+
+                switch (p.StorageType)
+                {
+                    case StorageType.String:
+                        return p.AsString() ?? "";
+                    case StorageType.Integer:
+                        return p.AsInteger().ToString(CultureInfo.InvariantCulture);
+                    case StorageType.Double:
+                        return p.AsDouble().ToString(CultureInfo.InvariantCulture);
+                    case StorageType.ElementId:
+                        var id = p.AsElementId();
+                        return (id != null && id != ElementId.InvalidElementId) ? id.Value.ToString(CultureInfo.InvariantCulture) : "";
+                    default:
+                        return p.AsValueString() ?? "";
+                }
             }
-            catch { return null; }
+            catch { return ""; }
         }
 
         private static bool GetBoolLike(Element e, string name)
         {
             try
             {
-                var p = e.LookupParameter(name);
+                var p = e?.LookupParameter(name);
                 if (p == null) return false;
 
                 if (p.StorageType == StorageType.Integer)
@@ -414,6 +476,8 @@ namespace RevitLOD3Exporter
                     if (s == "0") return false;
                     if (s.Equals("yes", StringComparison.OrdinalIgnoreCase)) return true;
                     if (s.Equals("no", StringComparison.OrdinalIgnoreCase)) return false;
+                    if (s.Equals("true", StringComparison.OrdinalIgnoreCase)) return true;
+                    if (s.Equals("false", StringComparison.OrdinalIgnoreCase)) return false;
                 }
             }
             catch { }
@@ -424,48 +488,81 @@ namespace RevitLOD3Exporter
         {
             try
             {
-                var p = e.LookupParameter(name);
+                var p = e?.LookupParameter(name);
                 if (p == null) return 0;
 
                 if (p.StorageType == StorageType.Integer) return p.AsInteger();
 
+                if (p.StorageType == StorageType.Double)
+                    return (int)Math.Round(p.AsDouble());
+
                 if (p.StorageType == StorageType.String)
                 {
                     var s = (p.AsString() ?? "").Trim().Replace(",", ".");
-                    if (int.TryParse(s, out int iv)) return iv;
-                    if (double.TryParse(s, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double dv))
+                    if (int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out int iv)) return iv;
+                    if (double.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out double dv))
                         return (int)Math.Round(dv);
-                }
-
-                if (p.StorageType == StorageType.Double)
-                {
-                    // might be unitless; treat as int
-                    return (int)Math.Round(p.AsDouble());
                 }
             }
             catch { }
             return 0;
         }
 
-        private static double GetDoubleLike(Element e, string name)
+        private static double GetAreaM2Like(Document doc, Element e, string name)
         {
             try
             {
-                var p = e.LookupParameter(name);
+                var p = e?.LookupParameter(name);
                 if (p == null) return 0.0;
 
-                if (p.StorageType == StorageType.Double) return p.AsDouble(); // NOTE: might be internal units
+                if (p.StorageType == StorageType.Double)
+                {
+                    double internalVal = p.AsDouble();
+
+                    // Try convert if units API available (Revit 2021+)
+                    try
+                    {
+                        return UnitUtils.ConvertFromInternalUnits(internalVal, UnitTypeId.SquareMeters);
+                    }
+                    catch
+                    {
+                        // If conversion fails, at least return the raw (still OK for >0 checks)
+                        return internalVal;
+                    }
+                }
+
                 if (p.StorageType == StorageType.Integer) return p.AsInteger();
 
                 if (p.StorageType == StorageType.String)
                 {
                     var s = (p.AsString() ?? "").Trim().Replace(",", ".");
-                    if (double.TryParse(s, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double dv))
+                    if (double.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out double dv))
                         return dv;
                 }
             }
             catch { }
             return 0.0;
+        }
+
+        // =====================================================
+        // Utils
+        // =====================================================
+
+        private static string SanitizeId(string s)
+        {
+            s = (s ?? "").Trim();
+            s = s.Trim('\'').Trim('"');
+            return s;
+        }
+
+        private static string NormalizeKey(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "";
+            s = s.Trim();
+            s = s.Replace('\u00A0', ' ').Replace('\u2007', ' ').Replace('\u202F', ' ');
+            while (s.IndexOf("  ", StringComparison.Ordinal) >= 0)
+                s = s.Replace("  ", " ");
+            return s;
         }
     }
 }

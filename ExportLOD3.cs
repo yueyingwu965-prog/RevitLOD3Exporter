@@ -24,7 +24,6 @@ namespace RevitLOD3Exporter
                 UIDocument uiDoc = uiApp.ActiveUIDocument;
                 Document doc = uiDoc.Document;
 
-                // 1. 选择 LOD2 输入文件
                 string lod2FilePath = SelectInputPath();
                 if (string.IsNullOrEmpty(lod2FilePath))
                 {
@@ -32,7 +31,6 @@ namespace RevitLOD3Exporter
                     return Result.Cancelled;
                 }
 
-                // 2. 选择 LOD3 输出路径
                 string lod3OutputPath = SelectOutputPath();
                 if (string.IsNullOrEmpty(lod3OutputPath))
                 {
@@ -40,20 +38,17 @@ namespace RevitLOD3Exporter
                     return Result.Cancelled;
                 }
 
-                // intro 文本
                 string introMessage =
                     "✔ Plugin Loaded Successfully!\n" +
                     "✔ Input File: " + Path.GetFileName(lod2FilePath) + "\n" +
                     "✔ Output File: " + Path.GetFileName(lod3OutputPath) + "\n\n" +
                     "Starting LOD2 to LOD3 conversion process...";
 
-                // 3 秒自动关闭的小窗体
                 using (var infoForm = new AutoCloseInfoForm(introMessage, 3000))
                 {
                     infoForm.ShowDialog();
                 }
 
-                // 3. 读取 LOD2 CityJSON
                 CityJSONData lod2Data = ReadLOD2File(lod2FilePath);
                 if (lod2Data == null)
                 {
@@ -61,7 +56,6 @@ namespace RevitLOD3Exporter
                     return Result.Failed;
                 }
 
-                // 4. ChatbotForm 获取导出配置（保持原逻辑）
                 ExportConfig config;
                 using (var chatForm = new ChatbotForm(lod2Data))
                 {
@@ -75,10 +69,8 @@ namespace RevitLOD3Exporter
                     config = chatForm.SelectedConfig ?? new ExportConfig();
                 }
 
-                // 5. 根据配置生成 LOD3 数据
                 CityJSONData lod3Data = ExtractLOD3Data(doc, lod2Data, config);
 
-                // 6. 保存 LOD3 文件
                 SaveLOD3File(lod3Data, lod3OutputPath);
 
                 TaskDialog.Show("Success",
@@ -98,7 +90,6 @@ namespace RevitLOD3Exporter
             }
         }
 
-        // 带 ExportConfig 的重载（保持原逻辑，仅调用内部无配置版本）
         private CityJSONData ExtractLOD3Data(Document doc, CityJSONData lod2Data, ExportConfig config)
         {
             CityJSONData lod3Data = ExtractLOD3Data(doc, lod2Data);
@@ -119,7 +110,6 @@ namespace RevitLOD3Exporter
             if (lod3Data.CityObjects == null)
                 return lod3Data;
 
-            // 类型过滤
             if (filterTypes)
             {
                 var keysToRemove = new List<string>();
@@ -142,10 +132,8 @@ namespace RevitLOD3Exporter
                 }
             }
 
-            // 属性过滤
             if (filterAttrs)
             {
-                // ★ 这里加上 element_id 等关键字段，永远保留
                 var alwaysKeep = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
                 {
                     "lod",
@@ -180,7 +168,6 @@ namespace RevitLOD3Exporter
             return lod3Data;
         }
 
-        // -------------------- File selection --------------------
 
         private string SelectInputPath()
         {
@@ -231,7 +218,6 @@ namespace RevitLOD3Exporter
             outputDialog.AddCommandLink(TaskDialogCommandLinkId.CommandLink1,
                 "✅ Use Default Output Path",
                 $"Use: {Path.GetFileName(defaultLod3OutputPath)}");
-            // 这里改回 CommandLink2
             outputDialog.AddCommandLink(TaskDialogCommandLinkId.CommandLink2,
                 "💾 Select Custom Output File",
                 "Choose a different location for LOD3 CityJSON file");
@@ -314,8 +300,6 @@ namespace RevitLOD3Exporter
             return null;
         }
 
-        // -------------------- Read / write JSON --------------------
-
         private CityJSONData ReadLOD2File(string filePath)
         {
             try
@@ -346,14 +330,12 @@ namespace RevitLOD3Exporter
                     Directory.CreateDirectory(directory);
                 }
 
-                // 清除不需要的 attributes
                 if (lod3Data?.CityObjects != null)
                 {
                     foreach (var cityObject in lod3Data.CityObjects.Values)
                     {
                         if (cityObject.Attributes != null)
                         {
-                            // 定义要移除的 attributes 列表
                             var attributesToRemove = new List<string>
                             {
                                 "revitType",
@@ -361,12 +343,11 @@ namespace RevitLOD3Exporter
                                 "revitPluginVersion",
                                 "revitDocument",
                                 "extractionDate",
-                                // 新增：清掉你不想在 QGIS 里看到的字段
                                 "dataSource",
                                 "software",
-                                "building_id",   // 我们不再使用 building_id
-                                "building",      // LOD2 中的 building 属性
-                                "sem_type"       // 不再用 attribute.sem_type
+                                "building_id",
+                                "building",
+                                "sem_type"
                             };
 
                             foreach (var attr in attributesToRemove)
@@ -396,7 +377,6 @@ namespace RevitLOD3Exporter
             }
         }
 
-        // -------------------- Core: LOD2 -> LOD3 --------------------
 
         private CityJSONData ExtractLOD3Data(Document doc, CityJSONData lod2Data)
         {
@@ -412,7 +392,6 @@ namespace RevitLOD3Exporter
                 lod2Data.CityObjects = CreateSampleCityObjects();
             }
 
-            // --- 改进 2：尽量保留 LOD2 的 metadata & revitInfo ---
             CityJSONMeta lod3Meta;
             if (lod2Data.Metadata != null)
             {
@@ -432,7 +411,6 @@ namespace RevitLOD3Exporter
                 };
             }
 
-            // 更新 revitInfo 中关于 LOD 的信息
             if (lod3Meta.RevitInfo == null)
                 lod3Meta.RevitInfo = new Dictionary<string, object>();
 
@@ -465,15 +443,12 @@ namespace RevitLOD3Exporter
                     Parents = null
                 };
 
-                // 保留原始 cityjsonObjectId，供 QGIS 使用 attribute.cityjsonObjectId
                 lod3Obj.Attributes["cityjsonObjectId"] = objId;
 
                 ConvertToLOD3Geometry(lod2Obj, lod3Obj, objId);
 
-                // 增加 Revit 元素级参数
                 AddRevitAttributes(doc, lod3Obj, objId);
 
-                // Building 和其他类型分开增强属性
                 if (string.Equals(lod3Obj.Type, "Building", StringComparison.OrdinalIgnoreCase))
                 {
                     EnhanceBuildingAttributes(lod3Obj);
@@ -490,7 +465,6 @@ namespace RevitLOD3Exporter
                 }
             }
 
-            // 反向添加 parents
             foreach (var entry in lod2Data.CityObjects)
             {
                 string parentId = entry.Key;
@@ -518,15 +492,11 @@ namespace RevitLOD3Exporter
                 CreateSampleBuilding(lod3Data);
             }
 
-            // NEW: add analysis attributes for QGIS
             AddAnalysisAttributes(lod3Data);
 
             return lod3Data;
         }
 
-        /// <summary>
-        /// 旧版 building_id 计算逻辑，目前不再使用，但保留以备将来需要。
-        /// </summary>
         private void AddBuildingIdAttributes(CityJSONData data)
         {
             if (data?.CityObjects == null || data.CityObjects.Count == 0)
@@ -803,7 +773,6 @@ namespace RevitLOD3Exporter
             }
         }
 
-        // --- 改进 3：更严格地清理退化三角形和重复点 ---
         private List<object> CleanBoundaries(List<object> original)
         {
             var cleaned = new List<object>();
@@ -838,7 +807,6 @@ namespace RevitLOD3Exporter
                         if (ring.Count < 3)
                             continue;
 
-                        // 1) 去掉连续重复点
                         for (int i = ring.Count - 1; i > 0; i--)
                         {
                             if (ring[i] == ring[i - 1])
@@ -847,7 +815,6 @@ namespace RevitLOD3Exporter
                         if (ring.Count < 3)
                             continue;
 
-                        // 2) 如果首尾相同，去掉最后一个
                         if (ring[0] == ring[ring.Count - 1])
                         {
                             ring.RemoveAt(ring.Count - 1);
@@ -855,7 +822,6 @@ namespace RevitLOD3Exporter
                                 continue;
                         }
 
-                        // 3) 至少需要 3 个不同的顶点，避免 a-b-a 这种退化三角形
                         var distinctCount = new HashSet<int>(ring).Count;
                         if (distinctCount < 3)
                             continue;
@@ -953,7 +919,6 @@ namespace RevitLOD3Exporter
             });
         }
 
-        // --- Revit attribute injection ---
         private void AddRevitAttributes(Document doc, CityJSONObj obj, string objId)
         {
             try
@@ -961,13 +926,11 @@ namespace RevitLOD3Exporter
                 if (obj.Attributes == null)
                     obj.Attributes = new Dictionary<string, object>();
 
-                // Basic document / export info
                 obj.Attributes["revitDocument"] = doc.Title;
                 obj.Attributes["revitExportDate"] = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
                 obj.Attributes["revitPluginVersion"] = "1.0";
                 obj.Attributes["geometrySource"] = "Revit LOD3 Export";
 
-                // If we already have an element_id from LOD2, try to fetch the Revit element
                 if (obj.Attributes.TryGetValue("element_id", out var eidObj))
                 {
                     int intId = -1;
@@ -985,7 +948,7 @@ namespace RevitLOD3Exporter
                         Element elem = doc.GetElement(rid);
                         if (elem != null)
                         {
-                            // ---- Category / family / type information ----
+
                             if (elem.Category != null)
                                 obj.Attributes["revitCategory"] = elem.Category.Name;
 
@@ -1002,17 +965,14 @@ namespace RevitLOD3Exporter
                                 obj.Attributes["revitTypeName"] = elem.Name;
                             }
 
-                            // ---- Bounding-box-based height in meters ----
                             BoundingBoxXYZ bb = elem.get_BoundingBox(null);
                             if (bb != null)
                             {
-                                double hFeet = bb.Max.Z - bb.Min.Z; // internal units = feet
+                                double hFeet = bb.Max.Z - bb.Min.Z;
                                 double hMeters = hFeet * 0.3048;
                                 obj.Attributes["revitBoundingHeight"] = Math.Round(hMeters, 3);
                             }
 
-                            // 这里原来会写 attributes["sem_type"]，现已去掉，
-                            // 在 QGIS 中直接使用 CityJSONObj.Type (字段 "type") 作为语义类型。
                         }
                     }
                 }
@@ -1023,7 +983,6 @@ namespace RevitLOD3Exporter
             }
         }
 
-        // --- Building 专用属性增强 ---
         private void EnhanceBuildingAttributes(CityJSONObj building)
         {
             if (building.Attributes == null)
@@ -1035,7 +994,7 @@ namespace RevitLOD3Exporter
             }
 
             building.Attributes["lod"] = "3";
-            // 不再写 dataSource / software，避免在 QGIS 里出现 attribute.dataSource / attribute.software
+
             building.Attributes["geometryType"] = "MultiSurface";
 
             if (!building.Attributes.ContainsKey("name"))
@@ -1043,7 +1002,6 @@ namespace RevitLOD3Exporter
                 building.Attributes["name"] = "LOD3_Building";
             }
 
-            // 尽量使用从 Revit 读取到的高度
             if (!building.Attributes.ContainsKey("measuredHeight"))
             {
                 if (building.Attributes.TryGetValue("revitBoundingHeight", out var hObj))
@@ -1070,7 +1028,6 @@ namespace RevitLOD3Exporter
             }
         }
 
-        // --- Wall / Opening 等普通对象的轻量属性增强 ---
         private void EnhanceGenericAttributes(CityJSONObj obj)
         {
             if (obj.Attributes == null)
@@ -1082,11 +1039,10 @@ namespace RevitLOD3Exporter
             }
 
             obj.Attributes["lod"] = "3";
-            // 同样不再写 dataSource / software，只保持 geometryType
+
             obj.Attributes["geometryType"] = "MultiSurface";
         }
 
-        // ====== 自动关闭的小窗体 ======
         private class AutoCloseInfoForm : System.Windows.Forms.Form
         {
             private readonly System.Windows.Forms.Timer _timer;
@@ -1135,18 +1091,12 @@ namespace RevitLOD3Exporter
                 base.Dispose(disposing);
             }
         }
-
-        /// <summary>
-        /// 为 QGIS retrofit 分析添加最小附加属性：
-        /// - 仅负责在缺失时补上 revitBoundingHeight（从全局 vertices 高度）
-        /// - 不再写 sem_type / building_id，避免在属性表中产生冗余列
-        /// </summary>
+ 
         private void AddAnalysisAttributes(CityJSONData data)
         {
             if (data == null || data.CityObjects == null || data.CityObjects.Count == 0)
                 return;
 
-            // 1) Compute global height from all vertices (maxZ - minZ)
             double minZ = double.MaxValue;
             double maxZ = double.MinValue;
 
@@ -1169,7 +1119,6 @@ namespace RevitLOD3Exporter
                 heightMeters = maxZ - minZ;
             }
 
-            // 2) Add attributes to each CityObject
             foreach (var kv in data.CityObjects)
             {
                 string objId = kv.Key;
@@ -1178,19 +1127,14 @@ namespace RevitLOD3Exporter
                 if (obj.Attributes == null)
                     obj.Attributes = new Dictionary<string, object>();
 
-                // 如果没有从 Revit 得到 revitBoundingHeight，就用全局高度兜底
                 if (!obj.Attributes.ContainsKey("revitBoundingHeight"))
                 {
                     obj.Attributes["revitBoundingHeight"] = Math.Round(heightMeters, 3);
                 }
-
-                // 不再写 sem_type / building_id，这样在 QGIS 中就不会生成
-                // attribute.sem_type / attribute.building_id 这些列。
             }
         }
     }
 
-    // -------------------- Data model classes --------------------
 
     public class CityJSONData
     {
@@ -1213,7 +1157,6 @@ namespace RevitLOD3Exporter
         public CityJSONMeta Metadata { get; set; }
     }
 
-    // --- 改进 2：扩展 metadata，保留 revitInfo 等 ---
     public class CityJSONMeta
     {
         [JsonProperty("referenceSystem")]

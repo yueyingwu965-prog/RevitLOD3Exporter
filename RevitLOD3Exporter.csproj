@@ -61,6 +61,8 @@
   <ItemGroup>
     <Compile Include="AiExportHelper.cs" />
     <Compile Include="App.cs" />
+    <Compile Include="Baseline2_Rules.cs" />
+    <Compile Include="Baseline3_DeepSeek.cs" />
     <Compile Include="ChatbotForm.cs">
       <SubType>Form</SubType>
     </Compile>

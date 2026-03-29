@@ -26,9 +26,6 @@ namespace RevitLOD3Exporter
         Gemini
     }
 
-    /// <summary>
-    /// 负责调用 AI，把自然语言解析成 AiConfigResult
-    /// </summary>
     public class AiExportHelper : IDisposable
     {
         private readonly HttpClient _httpClient;
@@ -36,7 +33,6 @@ namespace RevitLOD3Exporter
         private readonly string _model;
         private readonly AiProvider _provider;
 
-        // 各 provider 的默认模型
         private const string OpenAiDefaultModel = "gpt-4.1-mini";
         private const string DeepSeekDefaultModel = "deepseek-chat";
         private const string GeminiDefaultModel = "gemini-1.5-flash";
@@ -64,7 +60,6 @@ namespace RevitLOD3Exporter
 
             _httpClient = new HttpClient();
 
-            // 注意：Gemini 用 query 参数传 key，不用 Authorization 头
             if (_provider == AiProvider.OpenAI)
             {
                 _httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {_apiKey}");
@@ -75,9 +70,7 @@ namespace RevitLOD3Exporter
             }
         }
 
-        /// <summary>
-        /// 主函数：把用户输入交给 AI，返回解析后的 types / attributes
-        /// </summary>
+
         public async Task<AiConfigResult> ParseUserTextAsync(string userText)
         {
             if (string.IsNullOrWhiteSpace(userText))
@@ -166,7 +159,6 @@ Rules:
                         return new AiConfigResult();
                 }
 
-                // 尝试把模型返回的内容解析为 AiConfigResult
                 AiConfigResult parsed;
                 try
                 {
@@ -174,14 +166,13 @@ Rules:
                 }
                 catch
                 {
-                    // 如果解析失败，就返回空结果，交给外面 fallback
+
                     return new AiConfigResult();
                 }
 
                 if (parsed == null)
                     parsed = new AiConfigResult();
 
-                // 去重（忽略大小写）
                 parsed.Types = new List<string>(
                     new HashSet<string>(parsed.Types ?? new List<string>(), StringComparer.OrdinalIgnoreCase));
                 parsed.Attributes = new List<string>(
@@ -191,12 +182,11 @@ Rules:
             }
             catch (Exception ex)
             {
-                // 任何异常都交给上层去 fallback（ChatbotForm 里会 catch 然后走 rule-based parser）
+
                 throw new Exception($"AI provider '{_provider}' failed: {ex.Message}", ex);
             }
         }
 
-        // =========== 各 provider 的调用实现 ===========
 
         private async Task<string> CallOpenAiAsync(string systemPrompt, string userText)
         {
